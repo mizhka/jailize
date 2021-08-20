@@ -1,0 +1,820 @@
+#!/bin/sh 
+
+#
+# Script to manage jails for daily tasks based on dhcpd, netgraph and vnet
+#
+# Written by M.Zhilin aka mizhka (FreeBSD/NetCracker/PostgresPro)
+#
+# v0.1 - time to publish stable version (2016-2021)
+#
+
+### Some random notes below
+
+#### /boot/loader.conf
+# ipfw_nat_load="YES"
+# libalias_load="YES"
+# net.inet.ip.fw.default_to_accept="1"
+###############
+# pkg install dhcpd
+#####
+# unbound local
+# 
+#        module-config: "iterator"
+#        interface: 0.0.0.0
+#        access-control: 0.0.0.0/0 allow
+#############
+
+#### Poudriere ##### poudriere + nginx
+#zfs set mountpoint=/poudriere buildpool/jails/poudriere/data
+#
+#/usr/local/etc/poudriere.conf
+#ZPOOL=zroot
+#ZROOTFS=/jails/poudriere/data
+#BASEFS=/poudriere
+#BUILD_AS_NON_ROOT=yes
+#DISTFILES_CACHE=/poudriere/distfiles
+#FREEBSD_HOST=https://download.FreeBSD.org
+#KEEP_OLD_PACKAGES_COUNT=10
+#KEEP_OLD_PACKAGES=yes
+#MAX_EXECUTION_TIME=86400
+#NOLINUX=yes
+#PARALLEL_JOBS=3
+#PRESERVE_TIMESTAMP=yes
+#RESOLV_CONF=/etc/resolv.conf
+#USE_PORTLINT=no
+#ALLOW_MAKE_JOBS_PACKAGES="cmake pkg llvm* gcc* node* *webengine rust* firefox* mame mess"
+#
+#poudriere ports -c
+#poudriere jail -c -v 12.2-RELEASE -j amd64-12
+#poudriere jail -c -v 12.2-RELEASE -j amd64-12-debug
+#zfs create buildpool/jails/poudriere/data/distfiles
+#poudriere bulk -J 4 -j amd64-12 -p default databases/postgresql12-server
+
+# pkg install nginx
+# cp /usr/local/share/examples/poudriere/nginx.conf.sample /usr/local/etc/nginx/nginx.conf
+
+# Let's root it
+[ "root" != "$USER" ] && exec sudo $0 "$@"
+
+CONFFILE="/usr/local/etc/jailize.conf"
+
+if [ -f $CONFFILE ]; then
+	. $CONFFILE
+fi
+
+# command parameters
+_action="create"
+_basejail=base-default
+_clean=0
+_interactive=0
+_jailname="tmp`date +%Y%m%d`"
+_release=${RELEASE:-"12.2-RELEASE"}
+_verbose=0
+_quantity=1
+
+####### Extra settings
+_domain=${DOMAIN:-"unclebear.ru"}
+_internal_ip=${INTERNAL_IP:-"192.168.20.1"}
+_etherprefix=${ETHERPREFIX:-"6a:61:69:6c:"}
+_zfsjail=${ZFSJAIL:-"tank/jails"}
+_dirjail=${DIRJAIL:-"/usr/jails"}
+
+_dhcpconf="/usr/local/etc/jailize.dhcpd.conf"
+_jailconf="/usr/local/etc/jailize.jail.conf"
+_unboundconf="/var/unbound/conf.d/jailize.conf"
+
+# vnet
+KLDMODS="ng_ipfw ng_ether ng_nat ng_eiface"
+NG_IFPREFIX="ng-"
+INTERNAL_IF="${NG_IFPREFIX}jailgw"
+NG_NATNAME="jail_nat0"
+NG_BRGNAME="jail_bridge0"
+
+# base 
+DEFAULT_PKGS="pkg tmux zsh neovim pfetch python3 sudo"
+DISTR_HOST=https://download.freebsd.org/ftp/releases/amd64
+
+# Environment discovery
+EXTERNAL_IF=`netstat -r4n | grep defa | cut -f4 -w`
+EXTERNAL_IP=`ifconfig $EXTERNAL_IF | grep inet | cut -f3 -w`
+
+# Coloring
+RED='\033[0;31m'
+GREEN='\033[1;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m' # No Color
+
+######## Common functions
+log ( )
+{
+	if [ $_verbose -ne 0 ] ; then
+		echo -e "["$(date "+%v %T")" DEBUG]" $*
+	fi
+}
+
+print ( )
+{
+	echo -e "["$(date "+%v %T")" INFO ]" $*
+}
+
+print_error ( )
+{
+	echo -e "["$(date "+%v %T") "${RED}ERROR${NC}]" $*
+}
+
+fatal ( )
+{
+	echo "Stopped at function" $*
+	exit 1
+}
+
+helpme ( )
+{
+	echo "usage: jailize base [-c] [-b basejail] [-r release] [pkgs]"
+	echo "       jailize delta [-j jailname]"
+	echo "       jailize delete [-j jailname] "
+	echo "       jailize init"
+	echo "       jailize forward -j jailname port"
+	echo "       jailize list"
+	echo "       jailize rename [-j jailname] newname"
+	echo "       jailize start [-i] [-b basejail] [-j jailname]"
+	echo "       jailize shell [jailname]"
+	echo "       jailize vnet -a create"
+	echo "       jailize vnet -a delete"
+	echo "       jailize vnet -a fini"
+	echo "       jailize vnet -a init"
+}
+
+check_len ()
+{
+	local _val
+	_val=$1
+	
+	if [ "${_cmd}" == "delete" ]; then
+		return
+	fi
+
+	if [ ${#_val} -gt 12 ]; then
+		print_error "Jail name ($_val) is too long. Maximum length is 12 chars"
+		exit 1
+	fi
+}
+
+############# BASE ###############
+base_main ( )
+{
+	local _jaildir _jailzfs _url _pkgs _distcache
+
+	_jailname=${_basejail}
+	_jaildir=${_dirjail}/${_jailname}
+	_jailzfs=${_zfsjail}/${_jailname}
+	_url=${DISTR_HOST}/${_release}
+	_pkgs="${DEFAULT_PKGS} "$@
+        _distcache=${DISTCACHE}/${_release}/
+
+	print "Fill basejail \"${_jailname}\" by base and packages:"
+	print "*${YELLOW} ${_release} (base lib32)${NC}"
+	print "*${YELLOW} ${_pkgs}${NC}"
+
+	if [ ${_clean} -ne 0 ]
+	then
+		zfs get -H name ${_jailzfs} > /dev/null 2>&1
+		if [ $? -eq 0 ]; then
+			log "Clean old basejail ${_jailname}"
+			jls -j ${_jailname} > /dev/null 2>&1
+			if [ $? -eq 0 ] 
+			then
+				${_jailcmd} -r ${_jailname}	|| fatal base_main+${LINENO}
+			fi
+
+			mount | grep "${_jaildir}/" | cut -f3 -w | xargs -I$ umount $
+			# FIXME: cannot open 'tank/guests/vm/jails/base1202': dataset does not exist
+			zfs destroy -r ${_jailzfs}	|| fatal base_main+${LINENO}
+		fi
+	fi
+
+        mkdir -p ${_distcache}
+	if [ ! -e ${_distcache}/base.txz ] 
+	then
+		log "Fetch base.txz of ${_release} "
+		fetch -o ${_distcache} ${_url}/base.txz	|| fatal base_main+${LINENO}
+	fi
+
+	if [ ! -e ${_distcache}/lib32.txz ] 
+	then
+		log "Fetch lib32.txz of ${_release} "
+		fetch -o ${_distcache} ${_url}/lib32.txz	|| fatal base_main+${LINENO}
+	fi
+
+	zfs create -p -o mountpoint=${_jaildir} ${_jailzfs}	|| fatal base_main+${LINENO}
+	if [ ! -e ${_jaildir}/.tardone ]
+	then
+		log "Unpack base.txz and lib32.txz into new basejail ${_jailname}"
+		tar -xf base.txz  -C ${_jaildir}				|| fatal base_main+${LINENO}
+		tar -xf lib32.txz -C ${_jaildir}				|| fatal base_main+${LINENO}
+		touch ${_jaildir}/.tardone
+	fi
+	mkdir -p ${_jaildir}/usr/ports						|| fatal base_main+${LINENO}
+	
+	# freebsd-update -b ${BASEJAILDIR} fetch install  || fatal base_main+${LINENO}
+
+
+	print "Configure basejail ${_jailname}"
+	jail_singlestart  ${_jailname}	|| fatal base_main+${LINENO}
+
+	# rc.conf's ifconfig_X doesn't work in jail, so crontab it
+	(echo '@reboot (/sbin/dhclient $(/sbin/ifconfig -l ether))';\
+	 echo '@reboot (/sbin/ipfw add 5000 allow all from any to any)';) \
+	| jexec ${_jailname} crontab -
+
+	${_jailcmd} -rc ${_jailname}						|| fatal base_main+${LINENO}
+	jexec ${_jailname} pkg install -y ${_pkgs}	|| fatal base_main+${LINENO}
+	jexec ${_jailname} tee /usr/local/etc/zshrc > /dev/null <<EOF
+autoload promptinit;
+promptinit;
+prompt adam1 blue;
+export CLICOLOR=1
+EOF
+
+	${_jailcmd} -r ${_jailname}						|| fatal base_main+${LINENO}
+
+
+	zfs get -H name ${_jailzfs}@base > /dev/null 2>&1
+	if [ $? -eq 0 ] 
+	then
+		zfs destroy ${_jailzfs}@base
+	fi
+
+	zfs snapshot ${_jailzfs}@base				|| fatal base_main+${LINENO}
+
+	print "\"${_jailname}\" ready"
+	# Cleanup
+	zfs list -r -t snapshot ${_jailzfs}
+}
+
+
+############# VNET ###############
+
+# Load kernel modules
+load_kld ( )
+{
+	local _kldmod
+	print "Loading kernel modules"
+	for _kldmod in ${KLDMODS}; do
+		log "... Loading" ${_kldmod}
+		kldload -n ${_kldmod}
+	done
+	print "All kernel module loaded"
+}
+
+vnet_init_ipfw_nat ( )
+{
+	local _name _in _out _ext_ip _ext_if _int_ip _int_if
+	_name=$1
+	_ext_ip=$2
+	_ext_if=$3
+	_int_ip=$4
+	_int_if=$5
+
+	_in=100
+	_out=110
+
+	ngctl info ${_name}: > /dev/null 2>&1 && return
+	
+	print "[NAT] start configuration of $_name from $_int_ip/$_int_if to $_ext_ip/$_ext_if"
+	log "netgraph ipfw -> ${_in} -> nat /  ${_name} -> ${_out}"
+	ngctl mkpeer ipfw: nat ${_in} in				|| fatal vnet_init_ipfw_nat+${LINENO}
+	ngctl name ipfw:${_in} ${_name}					|| fatal vnet_init_ipfw_nat+${LINENO}
+	ngctl connect ipfw: ${_name}: ${_out} out		|| fatal vnet_init_ipfw_nat+${LINENO}
+	ngctl msg ${_name}: setaliasaddr ${_ext_ip}		|| fatal vnet_init_ipfw_nat+${LINENO}
+	log "ipfw"
+	vnet_destroy_ipfw_rules
+	ipfw -q add 200 allow ip from any to $_int_ip in via $_int_if		|| fatal vnet_init_ipfw_nat+${LINENO}
+	ipfw -q add 300 netgraph $_out all from any to any in via $_int_if	|| fatal vnet_init_ipfw_nat+${LINENO}
+	ipfw -q add 400 netgraph $_in all from any to any in via $_ext_if	|| fatal vnet_init_ipfw_nat+${LINENO}
+	ipfw -q add 500 allow ip from any to any							|| fatal vnet_init_ipfw_nat+${LINENO}
+	print "[NAT] done"
+}
+
+vnet_refresh_nat ( ) 
+{
+	_name=$1
+	_ext_ip=$2
+	ngctl msg ${_name}: setaliasaddr ${_ext_ip}		|| fatal vnet_refresh_nat+${LINENO}
+}
+
+vnet_destroy_ipfw_rules ( )
+{
+	ipfw -q delete 200 > /dev/null 2>&1
+	ipfw -q delete 300 > /dev/null 2>&1
+	ipfw -q delete 400 > /dev/null 2>&1
+	ipfw -q delete 500 > /dev/null 2>&1
+}
+
+vnet_destroy_ng_node ( )
+{
+	ngctl shutdown $1: > /dev/null 2>&1
+}
+
+vnet_init_jail_bridge ( )
+{
+	local _bridge _int_if _int_ip _ext_if _oldname _ether
+	_bridge=$1
+	_ext_if=$(echo $2 | tr . _)
+	_int_ip=$3
+	_int_if=$4
+	_ether="6a:61:69:6c:00:aa"
+
+	print "Initializing bridge $_bridge"
+	print "Interfaces: $_ext_if <> $_int_if/$_int_ip"
+
+	# Make sure the interface has been bridged
+	ngctl info ${_bridge}: > /dev/null 2>&1 && return
+	
+	# Create bridge
+	ngctl mkpeer $_ext_if: bridge lower link0 		|| fatal init_jail_bridge+${LINENO}
+	ngctl name $_ext_if:lower ${_bridge} 			|| fatal init_jail_bridge+${LINENO}
+	ngctl mkpeer ${_bridge}: eiface link1 ether		|| fatal init_jail_bridge+${LINENO}
+	# Disconnect from external interface 
+	ngctl rmhook ${_bridge}: link0 					|| fatal init_jail_bridge+${LINENO}
+	_oldname=`ngctl show -n ${_bridge}:link1 | cut -f3 -w`
+	ngctl name ${_bridge}:link1 ${_int_if} 			|| fatal init_jail_bridge+${LINENO}
+	ifconfig ${_oldname} name ${_int_if} > /dev/null || fatal init_jail_bridge+${LINENO}
+	ifconfig ${_int_if} inet alias ${_int_ip} > /dev/null || fatal init_jail_bridge+${LINENO}
+	ifconfig ${_int_if} ether ${_ether} 			|| fatal create_interface+${LINENO}
+	
+	print "Let packets continue with after being (de)aliased"
+	sysctl net.inet.ip.fw.one_pass=0
+	sysctl net.inet.ip.forwarding=1
+}
+
+vnet_fini ( ) 
+{
+	pkill -f "dhcpd ${INTERNAL_IF}"
+	vnet_destroy_ng_node ${NG_NATNAME}
+	vnet_destroy_ng_node ${NG_BRGNAME}
+	vnet_destroy_ng_node ${INTERNAL_IF}
+	vnet_destroy_ipfw_rules
+}
+
+vnet_init ( )
+{
+	local _out
+	
+	load_kld
+	vnet_init_jail_bridge ${NG_BRGNAME} ${EXTERNAL_IF} ${_internal_ip} ${INTERNAL_IF}
+	vnet_init_ipfw_nat ${NG_NATNAME} ${EXTERNAL_IP} ${EXTERNAL_IF} ${_internal_ip} ${INTERNAL_IF}
+	print "Start DHCPD on ${INTERNAL_IF}"
+	_out=$(dhcpd -c ${_dhcpconf} ${INTERNAL_IF} 2>&1)
+	if [ $? -ne 0 ]; then
+		print ${_out}
+		vnet_fini
+		fatal vnet_init+${LINENO}
+	fi
+}
+
+vnet_create ( ) {
+	local _num _link _ifname _oldname _ether _bridge
+
+	ngctl info ${NG_BRGNAME}: > /dev/null 2>&1 || vnet_init
+	_num=2
+	_ifname="${NG_IFPREFIX}${_jailname}"
+	_bridge=${NG_BRGNAME}
+
+	# Silently exit if interface exists (job is done before)
+	ngctl msg "$_ifname:" getifname > /dev/null 2>&1 && \
+	print "Interface $_ifname already exists" && return
+	
+	while ngctl msg ${_bridge}: getstats $_num > /dev/null 2>&1
+	do
+		_num=$(( $_num + 1 ))
+	done
+	
+	_link="link${_num}"
+	# 6a:61:69:6c means "jail"
+	# mac is linked to jailname which is immutable
+	# TODO how to avoid collision? base64? 
+	
+	_ether=$(md5 -qs ${_jailname} | sed -e "s#^\(..\)\(..\).*#\1:\2#g")
+	print "Create interface ${_ifname} with MAC ${_etherprefix}${_ether}"
+	ngctl mkpeer ${_bridge}: eiface ${_link} ether 	|| fatal create_interface+${LINENO}
+	_oldname=`ngctl show -n ${_bridge}:${_link} | cut -f3 -w`
+	log "Adjust names (netgraph) ${_oldname} -> ${_ifname}"
+	ngctl name ${_bridge}:${_link} ${_ifname} 		|| fatal create_interface+${LINENO}
+	log "Adjust names (if) ${_oldname} -> ${_ifname}"
+	ifconfig ${_oldname} name ${_ifname} > /dev/null || fatal create_interface+${LINENO}
+	print "Set MAC address: ${_etherprefix}${_ether}"
+	ifconfig ${_ifname} ether ${_etherprefix}${_ether} 			|| fatal create_interface+${LINENO}
+	print "Done"
+}
+
+vnet_main ( )
+{
+	case "${_action}" in
+		create)
+			vnet_create
+			;;
+		delete)
+			vnet_destroy_ng_node "${NG_IFPREFIX}${_jailname}"
+			;;
+		refresh)
+			vnet_refresh_nat ${NG_NATNAME} ${EXTERNAL_IP}
+			;;
+		init)
+			vnet_init
+			;;
+		fini)
+			vnet_fini
+			;;
+		*)
+			helpme
+	esac
+	exit 0
+}
+
+###################### Jail ################################
+
+jail_init () 
+{
+if [ ! -e  ${_dhcpconf} ]; then
+	cat > ${_dhcpconf} << EOF
+option subnet-mask 255.255.255.0;
+default-lease-time 600;
+max-lease-time 7200;
+subnet 192.168.20.0 netmask 255.255.255.0 {
+  range 192.168.20.2 192.168.20.40;
+  option domain-name-servers ${_internal_ip};
+  option routers ${_internal_ip};
+}
+EOF
+fi
+
+if [ ! -e ${_unboundconf} ]; then
+	cat > ${_unboundconf} << EOF
+server:
+        module-config: "iterator"
+        interface: 0.0.0.0
+        access-control: 0.0.0.0/0 allow
+EOF
+	service local_unbound restart
+fi
+
+if [ ! -e ${_jailconf} ]; then
+	cat > ${_jailconf} << EOF
+host.hostname="\$name.${_domain}";
+path = "${_dirjail}/\$name";
+vnet;
+vnet.interface = "${NG_IFPREFIX}\$name";
+
+exec.clean;
+
+# Start
+exec.prestart = "/sbin/mount -t unionfs -o below /usr/ports/ \${path}/usr/ports";
+exec.prestart += "sh /usr/local/bin/jailize vnet -a create -j \$name";
+exec.start = "/bin/sh /etc/rc";
+exec.start += "env netwait_ip=${_internal_ip} netwait_timeout=5 /etc/rc.d/netwait onestart";
+exec.poststart = "/sbin/zfs jail \$name ${_zfsjail}/\$name/data";
+
+## zfs mount -a inside jail
+## ----- exec.poststart += "sh /usr/local/bin/jailize forward -j \$name 80";
+## ----- osrelease="12.2-RELEASE";
+
+# Stop
+exec.stop = "/bin/sh /etc/rc.shutdown";
+exec.poststop = "/sbin/umount -f \${path}/usr/ports";
+exec.poststop += "sh /usr/local/bin/jailize vnet -a delete -j \$name";
+
+# Allows the jail to mount file systems: devfs, nullfs, tmpfs, procfs, zfs
+allow.mount;
+allow.mount.devfs;
+allow.mount.nullfs;
+allow.mount.tmpfs;
+allow.mount.procfs;
+allow.mount.zfs;
+
+allow.chflags;
+allow.raw_sockets;
+allow.set_hostname = 1;
+allow.socket_af;
+allow.sysvipc = 1;
+
+children.max = 20;
+devfs_ruleset = "6";
+
+enforce_statfs = 1;
+
+mount.devfs;
+EOF
+fi
+
+	zfs create -p ${_zfsjail}
+	vnet_init
+}
+
+jail_bulkstart ( )
+{
+	if [ ${_quantity} -eq 1 ]; then
+		jail_singlestart ${_jailname}
+	else
+		i=1
+		while [ "$i" -le "$_quantity" ]; do
+			jail_singlestart "${_jailname}$(printf %02d $i)"
+			i=$(($i + 1))
+		done
+	fi
+	vnet_refresh_nat ${NG_NATNAME} ${EXTERNAL_IP}
+}
+
+jail_bulkstop ( )
+{
+
+	if [ ${_quantity} -eq 1 ]; then
+		jail_singlestop ${_jailname}
+	else
+		i=1
+		while [ "$i" -le "$_quantity" ]; do
+			jail_singlestop "${_jailname}$(printf %02d $i)"
+			i=$(($i + 1))
+		done
+	fi
+}
+
+jail_singlestart ( )
+{
+	local _origin _targetname _jailzfs
+
+	_targetname=$1
+	_origin="${_zfsjail}/${_basejail}@base"
+	_jailzfs=${_zfsjail}/${_targetname}
+	
+	# Check if dataset exists 
+	zfs get name ${_zfsjail}/${_targetname} > /dev/null 2>&1
+	if [ $? -ne 0 ] 
+	then
+		log "Create ZFS dataset ${_jailzfs}"
+		zfs clone ${_origin} ${_jailzfs} 				||	\
+			fatal jail_singlestart+${LINENO}: zfs clone ${_origin} ${_jailzfs}
+	fi
+	zfs create -p -o mountpoint=none -o jailed=on ${_jailzfs}/data	||	\
+		fatal jail_singlestart+${LINENO}: zfs create -p -o mountpoint=none ${_jailzfs}/data
+
+	log "Register new temp jail in jail.conf"
+	grep -qxF "${_targetname} {}" ${_jailconf} 	|| \
+		printf "${_targetname} {}\n" >> ${_jailconf}
+
+	jls -j ${_targetname} > /dev/null 2>&1
+	if [ $? -ne 0 ] 
+	then
+		log "Start jail"
+		${_jailcmd} -c ${_targetname} 			||	\
+			fatal jail_singlestart+${LINENO}: ${_jailcmd} -c ${_targetname}
+	fi
+
+	if [ ${_interactive} -eq 1 ]
+	then 
+		jail_shell ${_targetname}
+	fi
+}
+
+jail_shell ( )
+{
+	local _targetname
+
+	_targetname=$1
+
+	log "Go to shell"
+	jexec -l ${_targetname} /bin/sh -c "pfetch" 2>/dev/null
+	jexec -l ${_targetname} /bin/sh -c "zsh" || exit 4
+}
+
+jail_singlestop ( )
+{
+	local _origin _targetname
+
+	_targetname=$1
+	${_jailcmd} -r ${_targetname} || \
+			fatal jail_singlestop+${LINENO}: ${_jailcmd} -r ${_targetname}
+}
+
+jail_rename ( )
+{
+	local _newname
+	
+	_newname=$1
+	jls -j ${_jailname} > /dev/null 2>&1
+	if [ $? -eq 0 ] 
+	then
+		${_jailcmd} -r ${_jailname}	|| \
+			fatal jail_rename+${LINENO}: ${_jailcmd} -r ${_jailname}
+	fi
+	
+	for pid in $(procstat -fa | grep -F "${_dirjail}/${_jailname}" | cut -w -f1 | uniq)
+	do
+		print "Killing "$pid 
+		procstat -c $pid
+		kill $pid
+	done
+	
+	# dataset
+	zfs rename ${_zfsjail}/${_jailname} ${_zfsjail}/${_newname}	|| \
+		fatal jail_rename+${LINENO}: zfs rename ${_zfsjail}/${_jailname} ${_zfsjail}/${_newname}
+	# jail.conf
+	sed -i '' -e "s#^${_jailname} {#${_newname} {#g" /etc/jail.conf || \
+		fatal jail_rename+${LINENO}: sed -i '' -e "s#^${_jailname} {#${_newname} {#g" /etc/jail.conf
+	# restart jail
+	${_jailcmd} -c ${_newname} || \
+		fatal jail_rename+${LINENO}: ${_jailcmd} -c ${_newname}
+}
+
+jail_list ( ) 
+{
+	local _jailstatus
+	for jailname in $(zfs list -H -d 1 -o name ${_zfsjail} | tail +2 | sed -e "s#${_zfsjail}/##"); do
+		
+		if jls -n -j $jailname > /dev/null 2>&1;
+		then
+			_jailstatus="${GREEN}  running ${NC}"
+		else
+			if [ "${jailname#base}" == "${jailname}" ];
+			then
+				_jailstatus="\`${RED}stopped ${NC}"
+			else
+				_jailstatus="*${YELLOW}basejail${NC}"
+			fi
+		fi
+		
+		echo -e $_jailstatus $jailname
+	done
+}
+
+jail_deletebulk ( )
+{
+
+	if [ ${_quantity} -eq 1 ]; then
+		jail_delete ${_jailname}
+	else
+		i=1
+		while [ "$i" -le "$_quantity" ]; do
+			jail_delete "${_jailname}$(printf %02d $i)"
+			i=$(($i + 1))
+		done
+	fi
+}
+
+jail_delete ( )
+{
+	local _jailzfs _targetname
+	
+	_targetname=$1
+	_jailzfs=${_zfsjail}/${_targetname}
+
+	# FIXME: cannot open 'tank/guests/vm/jails/base1202': dataset does not exist
+	# Check if dataset exists
+	zfs get name ${_jailzfs} > /dev/null 2>&1
+	if [ $? -eq 0 ] 
+	then
+		print "Removing jail ${_targetname}"
+		jls -j ${_targetname} > /dev/null 2>&1
+		if [ $? -eq 0 ] 
+		then
+			${_jailcmd} -r ${_targetname}		|| fatal delete_single+${LINENO}: ${_jailcmd} -r ${_targetname}
+		fi
+
+		for pid in $(procstat -fa | grep -F "${_dirjail}/${_targetname} " | cut -w -f2 | uniq)
+		do
+			print "Killing "$pid $(procstat -c $pid)
+			kill $pid
+		done
+
+		zfs destroy -r ${_jailzfs}	|| fatal delete_single+${LINENO}: zfs destroy -r ${_jailzfs}
+		print "Jail ${_targetname} removed"
+	else
+		print_error "${_targetname} doesn't exist"
+		jail_list
+	fi
+	
+}
+
+jail_diff ( )
+{
+	local _basedataset _jaildataset
+	
+	_jaildataset=${_zfsjail}/${_jailname}
+	_basedataset=$(zfs get -H -o value origin ${_jaildataset})
+	zfs diff -F ${_basedataset} ${_jaildataset} | \
+		grep "[[:space:]]F[[:space:]]" | \
+		cut -w -f3 | \
+		sed -e "s#${_dirjail}/${_jailname}##g" | \
+		sort | uniq
+}
+
+jail_forward ( ) 
+{
+	local _jailaddress _ifname _port 
+	_ifname="${NG_IFPREFIX}${_jailname}"
+	_jailaddress=$(jexec ${_jailname} ifconfig ${_ifname} inet | grep inet | cut -f3 -w)
+	_port=$1
+	ngctl msg jail_nat0: redirectport { local_addr=${_jailaddress} local_port=${_port} alias_port=${_port} proto=6 }
+}
+
+_cmd=$1
+shift
+
+while getopts "h?a:b:cij:n:r:v" opt; do
+	case "$opt" in
+	h|\?)
+		helpme
+		exit 0
+		;;
+	a)  _action=$OPTARG
+		;;
+	b)  _basejail=$OPTARG
+		check_len $OPTARG
+	    ;;
+	c)  _clean=1
+		;;
+	i)  _interactive=1
+	    ;;
+	j)  _jailname=$OPTARG
+		check_len $OPTARG
+		;;
+	n)  _quantity=$OPTARG
+		;;
+	r)  _release=$OPTARG
+		;;
+	v)  _verbose=1
+		;;
+	esac
+done
+shift $((OPTIND-1))
+
+
+if [ $_verbose -ne 0 ] ; then
+	_jailcmd="/usr/sbin/jail -v -f ${_jailconf}"
+else
+	_jailcmd="/usr/sbin/jail -f ${_jailconf}"
+fi
+
+case "$_cmd" in
+	vnet)
+		vnet_main
+		exit 0
+		;;
+	base)
+		base_main $@
+		exit 0
+		;;
+esac
+
+### Jail simplified cases
+if [ $# -gt 1 ];
+then 
+	helpme
+	exit 1
+fi
+
+if [ $# -eq 1 -a "$_cmd" != "forward" ];
+then
+	_jailname=$1
+fi
+
+case "$_cmd" in
+	init)
+		jail_init
+		exit 0
+		;;
+	start)
+		jail_bulkstart
+		exit 0
+		;;
+	stop)
+		jail_bulkstop
+		exit 0
+		;;
+	shell)
+		jail_shell ${_jailname}
+		exit 0
+		;;
+	list)
+		jail_list | sort 
+		exit 0
+		;;
+	delete)
+		jail_deletebulk
+		exit 0
+		;;
+	delta)
+		jail_diff
+		exit 0
+		;;
+	rename)
+		jail_rename $@
+		exit 0
+		;;
+	forward)
+		jail_forward $@
+		exit 0
+		;;
+	*)
+		helpme
+esac
