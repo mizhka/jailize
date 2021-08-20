@@ -93,6 +93,7 @@ NG_BRGNAME="jail_bridge0"
 # base 
 DEFAULT_PKGS="pkg tmux zsh neovim pfetch python3 sudo"
 DISTR_HOST=https://download.freebsd.org/ftp/releases/amd64
+DISTCACHE=${HOME}/.jailize/
 
 # Environment discovery
 EXTERNAL_IF=`netstat -r4n | grep defa | cut -f4 -w`
@@ -210,8 +211,8 @@ base_main ( )
 	if [ ! -e ${_jaildir}/.tardone ]
 	then
 		log "Unpack base.txz and lib32.txz into new basejail ${_jailname}"
-		tar -xf base.txz  -C ${_jaildir}				|| fatal base_main+${LINENO}
-		tar -xf lib32.txz -C ${_jaildir}				|| fatal base_main+${LINENO}
+		tar -xf ${_distcache}/base.txz  -C ${_jaildir}				|| fatal base_main+${LINENO}
+		tar -xf ${_distcache}/lib32.txz -C ${_jaildir}				|| fatal base_main+${LINENO}
 		touch ${_jaildir}/.tardone
 	fi
 	mkdir -p ${_jaildir}/usr/ports						|| fatal base_main+${LINENO}
