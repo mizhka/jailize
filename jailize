@@ -62,6 +62,8 @@ if [ -f $CONFFILE ]; then
 	. $CONFFILE
 fi
 
+_silence=${SILENCE:-"> /dev/null 2>&1"}
+
 # command parameters
 _action="create"
 _basejail=base-default
@@ -74,6 +76,7 @@ _quantity=1
 
 ####### Extra settings
 _domain=${DOMAIN:-"unclebear.ru"}
+_internal_nw=${INTERNAL_NW:-"192.168.20.0"}
 _internal_ip=${INTERNAL_IP:-"192.168.20.1"}
 _etherprefix=${ETHERPREFIX:-"6a:61:69:6c:"}
 _zfsjail=${ZFSJAIL:-"tank/jails"}
@@ -271,45 +274,104 @@ load_kld ( )
 vnet_init_ipfw_nat ( )
 {
 	local _name _in _out _ext_ip _ext_if _int_ip _int_if
-	_name=$1
-	_ext_ip=$2
-	_ext_if=$3
-	_int_ip=$4
-	_int_if=$5
 
-	_in=100
-	_out=110
+	_int_ip=$2
+	_int_if=$3  
 
-	ngctl info ${_name}: > /dev/null 2>&1 && return
-	
-	print "[NAT] start configuration of $_name from $_int_ip/$_int_if to $_ext_ip/$_ext_if"
-	log "netgraph ipfw -> ${_in} -> nat /  ${_name} -> ${_out}"
-	ngctl mkpeer ipfw: nat ${_in} in				|| fatal vnet_init_ipfw_nat+${LINENO}
-	ngctl name ipfw:${_in} ${_name}					|| fatal vnet_init_ipfw_nat+${LINENO}
-	ngctl connect ipfw: ${_name}: ${_out} out		|| fatal vnet_init_ipfw_nat+${LINENO}
-	ngctl msg ${_name}: setaliasaddr ${_ext_ip}		|| fatal vnet_init_ipfw_nat+${LINENO}
-	log "ipfw"
+    
+    print "[NAT] start configuration of $_name from $_int_ip/$_int_if"
+
+    # iterate over interfaces and construct firewall rules based on routing tables
+    log "ipfw"
+	# remove all ipfw rules between 100 and 999
 	vnet_destroy_ipfw_rules
-	ipfw -q add 200 allow ip from any to $_int_ip in via $_int_if		|| fatal vnet_init_ipfw_nat+${LINENO}
-	ipfw -q add 300 netgraph $_out all from any to any in via $_int_if	|| fatal vnet_init_ipfw_nat+${LINENO}
-	ipfw -q add 400 netgraph $_in all from any to any in via $_ext_if	|| fatal vnet_init_ipfw_nat+${LINENO}
-	ipfw -q add 500 allow ip from any to any							|| fatal vnet_init_ipfw_nat+${LINENO}
+	ipfw -q add 100 allow ip from any to $_int_ip in via $_int_if		|| fatal vnet_init_ipfw_nat+${LINENO}
+    
+	_i=0
+	for _ext_if in $(netstat -rn4 --libxo json | \
+	 jq '.statistics."route-information"."route-table"."rt-family"[] | select(."address-family"=="Internet") | ."rt-entry"[] | select(."interface-name"!="lo0") | select(."destination"!="'${_internal_nw}'/24")."interface-name"' | \
+	 sort | uniq | tr -d \")
+	do
+		_i=$((_i + 1))
+		_in=$((_i * 100))
+    	_out=$((_in + 10))
+    	_name=$1${_i}
+				
+		if [ ${_i} -ge 10 ]; then
+		    print "TOO MANY INTERFACES"
+		    fatal vnet_init_ipfw_nat+${LINENO}
+		fi
+		
+		_ext_ip=$(ifconfig ${_ext_if} inet | grep inet | cut -f3 -w)
+		print \\t ${_i}: ${_name}\\t${_ext_if}\\t${_ext_ip}\\t${_in}\\t${_out}
+	    
+	    _j=0
+	    # loop over network masks 
+	    for _ext_nw in $(netstat -rn4  | grep ${_ext_if} | cut -f1 -w | sort | uniq) 
+	    do
+	        _j=$((_j + 1))
+	        if [ "${_ext_nw}" = "default" ]; then
+	            ipfw -q add 998 netgraph ${_out} all from ${_internal_nw}/24 to any in via ${_int_if}	|| fatal vnet_init_ipfw_nat+${LINENO}
+	        else
+    	        ipfw -q add $((_in + _j)) netgraph ${_out} all from any to ${_ext_nw} in via ${_int_if}	|| fatal vnet_init_ipfw_nat+${LINENO}
+    	    fi
+	    done
+        ipfw -q add $((_in + 99)) netgraph ${_in} all from any to any in via ${_ext_if}	|| fatal vnet_init_ipfw_nat+${LINENO}
+        
+       	# exit if ipfw/nat is configured
+    	ngctl info ${_name}: > /dev/null 2>&1 && continue
+		
+		#ngctl mkpeer ipfw: nat ${_in} in				|| fatal vnet_init_ipfw_nat+${LINENO}
+	    #ngctl name ipfw:${_in} ${_name}					|| fatal vnet_init_ipfw_nat+${LINENO}
+	    #ngctl connect ipfw: ${_name}: ${_out} out		|| fatal vnet_init_ipfw_nat+${LINENO}
+	    
+		ngctl mkpeer ipfw: tee ${_in} left				|| fatal vnet_init_ipfw_nat+${LINENO}
+        ngctl name ipfw:${_in} di_${_name}   			|| fatal vnet_init_ipfw_nat+${LINENO}
+		ngctl mkpeer di_${_name}: nat right in   		|| fatal vnet_init_ipfw_nat+${LINENO}
+	    ngctl name di_${_name}:right ${_name}			|| fatal vnet_init_ipfw_nat+${LINENO}
+	    
+	    ngctl mkpeer ipfw: tee ${_out} left				|| fatal vnet_init_ipfw_nat+${LINENO}
+        ngctl name ipfw:${_out} do_${_name}   			|| fatal vnet_init_ipfw_nat+${LINENO}
+	    
+	    ngctl connect do_${_name}: ${_name}: right out	|| fatal vnet_init_ipfw_nat+${LINENO}
+	    
+	    ngctl msg ${_name}: setaliasaddr ${_ext_ip}		|| fatal vnet_init_ipfw_nat+${LINENO}
+	done
+
+        # golden rule
+	ipfw -q add 65535 allow ip from any to any      	|| fatal vnet_init_ipfw_nat+${LINENO}
 	print "[NAT] done"
 }
 
 vnet_refresh_nat ( ) 
 {
-	_name=$1
-	_ext_ip=$2
-	ngctl msg ${_name}: setaliasaddr ${_ext_ip}		|| fatal vnet_refresh_nat+${LINENO}
+
+	for _ext_if in $(netstat -rn4 --libxo json | \
+	 jq '.statistics."route-information"."route-table"."rt-family"[] | select(."address-family"=="Internet") | ."rt-entry"[] | select(."interface-name"!="lo0") | select(."destination"!="'${_internal_nw}'/24")."interface-name"' | \
+	 sort | uniq | tr -d \")
+	do
+		_i=$((_i + 1))
+    	_name=$1${_i}
+				
+		if [ ${_i} -ge 10 ]; then
+		    print "TOO MANY INTERFACES"
+		    fatal vnet_refresh_nat+${LINENO}
+		fi
+		
+		_ext_ip=$(ifconfig ${_ext_if} inet | grep inet | cut -f3 -w)
+		print \\t ${_i}: ${_name}\\t${_ext_if}\\t${_ext_ip}
+	    
+	    ngctl msg ${_name}: setaliasaddr ${_ext_ip}		|| fatal vnet_refresh_nat+${LINENO}
+	done
 }
 
 vnet_destroy_ipfw_rules ( )
 {
-	ipfw -q delete 200 > /dev/null 2>&1
-	ipfw -q delete 300 > /dev/null 2>&1
-	ipfw -q delete 400 > /dev/null 2>&1
-	ipfw -q delete 500 > /dev/null 2>&1
+    _i=100
+    while [ ${_i} -lt 1000 ]; do 
+        ipfw -q delete ${_i} > /dev/null 2>&1
+        _i=$((_i + 1))
+    done
 }
 
 vnet_destroy_ng_node ( )
@@ -352,7 +414,15 @@ vnet_init_jail_bridge ( )
 vnet_fini ( ) 
 {
 	pkill -f "dhcpd ${INTERNAL_IF}"
-	vnet_destroy_ng_node ${NG_NATNAME}
+	
+	_i=1
+    while [ ${_i} -lt 10 ]; do 
+        vnet_destroy_ng_node ${NG_NATNAME}${_i}
+        vnet_destroy_ng_node di_${NG_NATNAME}${_i}
+        vnet_destroy_ng_node do_${NG_NATNAME}${_i}
+        _i=$((_i + 1))
+    done
+
 	vnet_destroy_ng_node ${NG_BRGNAME}
 	vnet_destroy_ng_node ${INTERNAL_IF}
 	vnet_destroy_ipfw_rules
@@ -360,17 +430,22 @@ vnet_fini ( )
 
 vnet_init ( )
 {
-	local _out
+	local _out _i
 	
 	load_kld
 	vnet_init_jail_bridge ${NG_BRGNAME} ${EXTERNAL_IF} ${_internal_ip} ${INTERNAL_IF}
-	vnet_init_ipfw_nat ${NG_NATNAME} ${EXTERNAL_IP} ${EXTERNAL_IF} ${_internal_ip} ${INTERNAL_IF}
-	print "Start DHCPD on ${INTERNAL_IF}"
-	_out=$(dhcpd -c ${_dhcpconf} ${INTERNAL_IF} 2>&1)
-	if [ $? -ne 0 ]; then
-		print ${_out}
-		vnet_fini
-		fatal vnet_init+${LINENO}
+
+	vnet_init_ipfw_nat ${NG_NATNAME} ${_internal_ip} ${INTERNAL_IF}
+
+	print "Start DHCPD on ${INTERNAL_IF}"	
+	pgrep -f "dhcpd -c ${_dhcpconf} ${INTERNAL_IF}" > /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+	    _out=$(dhcpd -c ${_dhcpconf} ${INTERNAL_IF} 2>&1)
+	    if [ $? -ne 0 ]; then
+		    print ${_out}
+		    vnet_fini
+		    fatal vnet_init+${LINENO}
+	    fi
 	fi
 }
 
@@ -419,7 +494,7 @@ vnet_main ( )
 			vnet_destroy_ng_node "${NG_IFPREFIX}${_jailname}"
 			;;
 		refresh)
-			vnet_refresh_nat ${NG_NATNAME} ${EXTERNAL_IP}
+			vnet_refresh_nat ${NG_NATNAME}
 			;;
 		init)
 			vnet_init
@@ -523,7 +598,7 @@ jail_bulkstart ( )
 			i=$(($i + 1))
 		done
 	fi
-	vnet_refresh_nat ${NG_NATNAME} ${EXTERNAL_IP}
+	vnet_refresh_nat ${NG_NATNAME}
 }
 
 jail_bulkstop ( )
