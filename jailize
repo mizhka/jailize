@@ -62,8 +62,6 @@ if [ -f $CONFFILE ]; then
 	. $CONFFILE
 fi
 
-_silence=${SILENCE:-"> /dev/null 2>&1"}
-
 # command parameters
 _action="create"
 _basejail=base-default
@@ -278,15 +276,14 @@ vnet_init_ipfw_nat ( )
 	_int_ip=$2
 	_int_if=$3  
 
-    
-    print "[NAT] start configuration of $_name from $_int_ip/$_int_if"
+	
+	print "[NAT] start configuration of $_name from $_int_ip/$_int_if"
 
-    # iterate over interfaces and construct firewall rules based on routing tables
-    log "ipfw"
+	
 	# remove all ipfw rules between 100 and 999
 	vnet_destroy_ipfw_rules
 	ipfw -q add 100 allow ip from any to $_int_ip in via $_int_if		|| fatal vnet_init_ipfw_nat+${LINENO}
-    
+	# iterate over interfaces and construct firewall rules based on routing tables
 	_i=0
 	for _ext_if in $(netstat -rn4 --libxo json | \
 	 jq '.statistics."route-information"."route-table"."rt-family"[] | select(."address-family"=="Internet") | ."rt-entry"[] | select(."interface-name"!="lo0") | select(."destination"!="'${_internal_nw}'/24")."interface-name"' | \
@@ -338,8 +335,8 @@ vnet_init_ipfw_nat ( )
 	    ngctl msg ${_name}: setaliasaddr ${_ext_ip}		|| fatal vnet_init_ipfw_nat+${LINENO}
 	done
 
-        # golden rule
-	ipfw -q add 65535 allow ip from any to any      	|| fatal vnet_init_ipfw_nat+${LINENO}
+	# golden rule
+	ipfw -q add 65534 allow ip from any to any      	|| fatal vnet_init_ipfw_nat+${LINENO}
 	print "[NAT] done"
 }
 
@@ -367,11 +364,11 @@ vnet_refresh_nat ( )
 
 vnet_destroy_ipfw_rules ( )
 {
-    _i=100
-    while [ ${_i} -lt 1000 ]; do 
-        ipfw -q delete ${_i} > /dev/null 2>&1
-        _i=$((_i + 1))
-    done
+	_i=100
+	while [ ${_i} -lt 1000 ]; do
+		ipfw -q delete ${_i} > /dev/null 2>&1
+		_i=$((_i + 1))
+	done
 }
 
 vnet_destroy_ng_node ( )
@@ -416,7 +413,7 @@ vnet_fini ( )
 	pkill -f "dhcpd ${INTERNAL_IF}"
 	
 	_i=1
-    while [ ${_i} -lt 10 ]; do 
+    while [ ${_i} -lt 10 ]; do
         vnet_destroy_ng_node ${NG_NATNAME}${_i}
         vnet_destroy_ng_node di_${NG_NATNAME}${_i}
         vnet_destroy_ng_node do_${NG_NATNAME}${_i}
@@ -439,13 +436,13 @@ vnet_init ( )
 
 	print "Start DHCPD on ${INTERNAL_IF}"	
 	pgrep -f "dhcpd -c ${_dhcpconf} ${INTERNAL_IF}" > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-	    _out=$(dhcpd -c ${_dhcpconf} ${INTERNAL_IF} 2>&1)
-	    if [ $? -ne 0 ]; then
-		    print ${_out}
-		    vnet_fini
-		    fatal vnet_init+${LINENO}
-	    fi
+	if [ $? -ne 0 ]; then
+		_out=$(dhcpd -c ${_dhcpconf} ${INTERNAL_IF} 2>&1)
+		if [ $? -ne 0 ]; then
+			print ${_out}
+			vnet_fini
+			fatal vnet_init+${LINENO}
+		fi
 	fi
 }
 
